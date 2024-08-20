@@ -2,6 +2,8 @@ import torch
 import numpy as np
 from scipy.optimize import minimize
 
+from helpers import min_with_index
+
 
 def compute_eval_matrices(group_distributions, times):
     A,S = {},{}
@@ -13,8 +15,6 @@ def compute_eval_matrices(group_distributions, times):
             A[perform_name].append(out[:,:,0].cpu().detach().numpy())
             S[perform_name].append((out[:,:,1]**2).cpu().detach().numpy())
     return A,S
-
-
 
 def euclidean_norm_constraint(x):
     return np.sum(x**4)-1
@@ -104,3 +104,50 @@ def compute_performance_distribution(t,gamma,group_network,An,bn,Sn,n_train_unit
     unc_model = torch.sum(torch.mean(preds_vars[:,:,1:], axis=0),dim=-1,keepdim=True)
     unc_Fut=torch.var(preds_mean, axis=0)+torch.sum(torch.var(preds_vars, axis=0),dim=-1,keepdim=True)
     return pred_mean,unc_model,unc_data,unc_Fut
+
+
+def computeRUL(RULs,EOLcauses,performEOL,t_n):
+    for name in RULs.keys():
+        EOL,cause_idx=min_with_index(performEOL[perform_name][name] for perform_name in performEOL.keys())
+        RULs[name].append(max(EOL-t_n,0))
+        EOLcauses[name].append(cause_idx)
+
+def compute_uncertainties(var_Data,var_Model,var_Fut,conserv):
+    std_Data = torch.sqrt(var_Data)
+    var_ModelData = var_Data+var_Model
+    std_ModelData = torch.sqrt(var_ModelData)
+    std_ModelDataFut = torch.sqrt(var_ModelData+var_Fut)
+    return (std_Data,std_ModelDataFut,torch.sqrt(std_Data**2+(1-conserv)**2*std_ModelDataFut**2)),std_ModelData   
+
+def compute_remaining_perform_up(threshold,pred,std):
+    return threshold-(pred+1.96*std)
+
+def compute_remaining_perform_unc_up(threshold,pred,std):
+    return threshold-(pred-1.96*std)
+
+def compute_remaining_perform_down(threshold,pred,std):
+    return (pred-1.96*std)-threshold
+
+def compute_remaining_perform_unc_down(threshold,pred,std):
+    return (pred+1.96*std)-threshold
+
+def compute_performEOL(performEOL,pred_names,perform_pred,stds,
+                    t,threshold,monot,max_life):   
+    # compute remaining performance
+    unc=stds[1]
+    if monot=='+':
+        remaining_performance={name:compute_remaining_perform_up(threshold,perform_pred,std) for name,std in zip(pred_names[:-1],stds)} 
+        remaining_performance[pred_names[-1]]=compute_remaining_perform_unc_up(threshold,perform_pred,unc)
+    elif monot=='-':
+        remaining_performance={name:compute_remaining_perform_down(threshold,perform_pred,std) for name,std in zip(pred_names[:-1],stds)} 
+        remaining_performance[pred_names[-1]]=compute_remaining_perform_unc_down(threshold,perform_pred,unc)
+    else:
+        print(f'Performance metric has an incorrect monotonicity. Must be increasing (+) or decreasing (-)')
+    
+    for name in pred_names:
+        neg_mask=remaining_performance[name]<0
+        if torch.any(neg_mask):
+            neg_ind=torch.nonzero(neg_mask)[0]
+            performEOL[name]=0.5*(t[neg_ind]+t[neg_ind-1])[0].item()
+        else:
+            performEOL[name]=max_life

@@ -12,14 +12,16 @@ from IPython.display import display
 
 
 # Custom modules 
-from helpers import gpu2np
-from method import compute_performance_distribution 
+from helpers import gpu2np,generate_tuples,generate_colors
+from method import compute_performance_distribution,computeRUL,compute_uncertainties,compute_performEOL 
 
-def setup_rul_video_uav():
-    causes_text = ['out of power', 'pos error', 'cum time out']
-    colors = ['green', 'blue', 'red']
-    perform_names = ['SOC', 'POS', 'CUM']
-    ax_ids = [(0,0),(0, 1), (1, 0), (1, 1)]
+
+def setup_rul_video_uav(perform_names,causes_text):
+    n_perform=len(perform_names)
+    assert len(causes_text)==n_perform, 'Each performance must have a cause of failure'
+    colors = generate_colors(n_perform)
+    ax_ids = generate_tuples(n_perform+1)
+
     pred_names='acc','csv','pred','unc'
         
     perform_pred_line = dict.fromkeys(perform_names)
@@ -28,7 +30,7 @@ def setup_rul_video_uav():
     plot_predRUL['pred']={pred_name+'_RUL': None for pred_name in pred_names}
     plot_predRUL['color']={pred_name+'_color': None for pred_name in pred_names}
 
-    return causes_text, colors, perform_names, pred_names, ax_ids, perform_pred_line,performEOL,plot_predRUL
+    return colors, pred_names, ax_ids, perform_pred_line,performEOL,plot_predRUL
 
 def setup_rul_video_NCMAPSS():
     causes_text = ['HPT_eff']
@@ -80,8 +82,6 @@ def setup_plot_perform(ax,t,thres,t_observ, b, name, unit, y_lim, loc,time_unit=
     ax.fill_between([], [], [], color='blue', alpha=0.2, label='model unc')
     ax.fill_between([], [], [], color='red', alpha=0.2, label='future unc')
 
-    # title=f'{name} Prediction + Uncertainty'
-    # if unit: title=title+f' (unit {unit})'    
     title=f'Prediction + Uncertainty ({name})'        
     ax.set_title(title)
     ax.set_xlabel(f'time ({time_unit})')
@@ -97,8 +97,6 @@ def update_plot_perform(ax,mean_line,
     ax.scatter(t_n, b_n, color='green')
     mean_line.set_data(t, mean)
     
-    # if (b_est is not None) and t_n < b_est.shape[0]:
-    #     ax.scatter(time_est[t_n], b_est[t_n], label='estimation', color='orange')
     for collection in ax.collections: 
         if isinstance(collection, PolyCollection): 
             collection.remove()
@@ -134,51 +132,6 @@ def update_plot_predRUL(ax,t, acc_RUL,csv_RUL,pred_RUL,unc_RUL,acc_color,csv_col
     ax.fill_between(t,csv_RUL, acc_RUL, color='gray', alpha=0.5) 
     ax.fill_between(t,acc_RUL, unc_RUL, color='gray', alpha=0.2) 
 
-def compute_uncertainties(var_Data,var_Model,var_Fut,conserv):
-    std_Data = torch.sqrt(var_Data)
-    var_ModelData = var_Data+var_Model
-    std_ModelData = torch.sqrt(var_ModelData)
-    std_ModelDataFut = torch.sqrt(var_ModelData+var_Fut)
-    return (std_Data,std_ModelDataFut,torch.sqrt(std_Data**2+(1-conserv)**2*std_ModelDataFut**2)),std_ModelData    
-
-def compute_remaining_perform_up(threshold,pred,std):
-    return threshold-(pred+1.96*std)
-
-def compute_remaining_perform_unc_up(threshold,pred,std):
-    return threshold-(pred-1.96*std)
-
-def compute_remaining_perform_down(threshold,pred,std):
-    return (pred-1.96*std)-threshold
-
-def compute_remaining_perform_unc_down(threshold,pred,std):
-    return (pred+1.96*std)-threshold
-
-def compute_performEOL(performEOL,pred_names,perform_pred,stds,
-                    t,threshold,monot,max_life):   
-    # compute remaining performance
-    unc=stds[1]
-    if monot=='+':
-        remaining_performance={name:compute_remaining_perform_up(threshold,perform_pred,std) for name,std in zip(pred_names[:-1],stds)} 
-        remaining_performance[pred_names[-1]]=compute_remaining_perform_unc_up(threshold,perform_pred,unc)
-    elif monot=='-':
-        remaining_performance={name:compute_remaining_perform_down(threshold,perform_pred,std) for name,std in zip(pred_names[:-1],stds)} 
-        remaining_performance[pred_names[-1]]=compute_remaining_perform_unc_down(threshold,perform_pred,unc)
-    else:
-        print(f'Performance metric has an incorrect monotonicity. Must be increasing (+) or decreasing (-)')
-    
-    for name in pred_names:
-        neg_mask=remaining_performance[name]<0
-        if torch.any(neg_mask):
-            neg_ind=torch.nonzero(neg_mask)[0]
-            performEOL[name]=0.5*(t[neg_ind]+t[neg_ind-1])[0].item()
-        else:
-            performEOL[name]=max_life
-
-def min_with_index(lst):
-    # Find the minimum value and its index
-    min_val, min_arg = min((val, idx) for idx, val in enumerate(lst))
-    return min_val, min_arg
-
 def highlight_preform_box(ax,color):
     for spine in ax.spines.values():
         spine.set_edgecolor(color)
@@ -188,12 +141,6 @@ def reset_preform_box(ax):
     for spine in ax.spines.values():
         spine.set_edgecolor('black')
         spine.set_linewidth(0.8)
-
-def computeRUL(RULs,EOLcauses,performEOL,t_n):
-    for name in RULs.keys():
-        EOL,cause_idx=min_with_index(performEOL[perform_name][name] for perform_name in performEOL.keys())
-        RULs[name].append(max(EOL-t_n,0))
-        EOLcauses[name].append(cause_idx)
 
 def fill_info_plot_predRUL(plot_predRUL,RULs,EOLcauses,pred_names,t_observ,colors,n):
     for name in pred_names:
@@ -221,19 +168,17 @@ def update_perform_box(axes,ax_ids,n,colors,EOLcause):
             reset_preform_box(ax=EOLax_prev)
             highlight_preform_box(ax=EOLax,color=colors[EOLidx])
 
-
-
-def make_rul_video(unit, t_np, t_observ, true_RUL, failure_cause, monot, threshold, group_networks, A, b, S, gamma, 
-        y_lim, loc, time_unit,
-        time_est=None, A_est=None, b_est=None, 
-        n_train_unit=80, n_paths=20,ood_coef=0, 
-        max_life=130, tol=1e-4, max_iter=100,
-        accel=1, save=False, conserv=0.5):
+def make_rul_video(unit, t_np, t_observ, true_RUL, failure_cause, 
+                monot, threshold, group_networks, A, b, S, gamma, y_lim, loc,
+                perform_names,causes_text, time_unit,
+                n_train_unit=80, n_paths=20,ood_coef=0, 
+                max_life=130,
+                accel=1, save=False, conserv=0.5):
     
     t_torch = torch.tensor(t_np, dtype=torch.float32,device=list(group_networks.values())[0].device).unsqueeze(1)
     
     # Setup video
-    causes_text, colors, perform_names, pred_names, ax_ids, perform_pred_line,performEOL,plot_predRUL=setup_rul_video_uav()
+    colors, pred_names, ax_ids, perform_pred_line,performEOL,plot_predRUL=setup_rul_video_uav(perform_names,causes_text) 
 
     # Setup plot
     fig, axes = setup_plot_axes(unit,conserv,ood_coef)
@@ -245,23 +190,13 @@ def make_rul_video(unit, t_np, t_observ, true_RUL, failure_cause, monot, thresho
     def make_frame(t_n):
         ood_coef
         nonlocal RULs,times,EOLcauses,n
+
+        ## ----Method---- ##
         for i, name in enumerate(perform_names):
             An = A[name][:n]
             Sn = S[name][:n]
             bn = b[name][:n]
 
-            # Add estimation if necessary
-            if (b_est[name] is not None) and n < b_est[name].shape[0]:
-                An = np.concatenate([An, A_est[name][:n]], axis=0)
-                bn = np.concatenate([bn, b_est[name][:n]], axis=0)
-
-            # perform_pred, var_Model,var_Data,var_Fut=compute_performance_distribution(t_torch,
-            #                                                                     gamma=gamma[name],
-            #                                                                     group_network=group_networks[name],
-            #                                                                     An=An,bn=bn,Sn=Sn,
-            #                                                                     n_train_unit=n_train_unit,
-            #                                                                     n_paths=n_paths,ood_coef=ood_coef
-            #                                                                     )
             perform_pred, var_Model,var_Data,var_Fut=compute_performance_distribution(t_torch,
                                                                                 gamma=gamma[name],
                                                                                 group_network=group_networks[name],
@@ -274,7 +209,6 @@ def make_rul_video(unit, t_np, t_observ, true_RUL, failure_cause, monot, thresho
             
             # Send to numpy for plotting
             perform_pred_np=gpu2np(perform_pred)
-            #stds=tuple([gpu2np(std) for std in stds])
             unc_Data=gpu2np(stds[0])
             unc_ModelData=gpu2np(unc_ModelData)
             unc_ModelDataFut=gpu2np(stds[1])
@@ -284,11 +218,12 @@ def make_rul_video(unit, t_np, t_observ, true_RUL, failure_cause, monot, thresho
             update_plot_perform(axes[ax_ids[i+1]],perform_pred_line[name],
                                 t_n, b[name][n-1], t_np, 
                                 perform_pred_np, unc_Data, unc_ModelData, unc_ModelDataFut)
-        computeRUL(RULs,EOLcauses,performEOL,t_n)
+        computeRUL(RULs,EOLcauses,performEOL,t_n)        
+        ## ------------- ##
+
         fill_info_plot_predRUL(plot_predRUL,RULs,EOLcauses,pred_names,t_observ,colors,n)
         update_perform_box(axes,ax_ids[1:],n,colors,EOLcause=EOLcauses['pred'])
-        update_plot_predRUL(axes[0, 0], plot_predRUL['time'], **plot_predRUL['pred'],**plot_predRUL['color'])
-        #update_plot_predRUL(axes[0], plot_predRUL['time'], **plot_predRUL['pred'],**plot_predRUL['color'])
+        update_plot_predRUL(axes[ax_ids[0]], plot_predRUL['time'], **plot_predRUL['pred'],**plot_predRUL['color'])
         frame = mplfig_to_npimage(fig)
         n += 1
         return frame
@@ -305,7 +240,7 @@ def make_rul_video(unit, t_np, t_observ, true_RUL, failure_cause, monot, thresho
 
     return RULs, EOLcauses 
 
-def plot_perform_prediction(ax, t_observ, b, t, mean, std_Data, std_ModelData, std_ModelDataFut, thres, name, unit, y_lim, loc,time_unit, b_n, t_n, time_est=None, b_est=None):
+def plot_perform_prediction(ax, t_observ, b, t, mean, std_Data, std_ModelData, std_ModelDataFut, thres, name, unit, y_lim, loc,time_unit, b_n, t_n):
     ax.set_xlabel(f'time ({time_unit})')
     ax.set_ylabel(f'{name}')
     #ax.axhline(y=thres, color='r', linestyle='--', label=f'threshold')
@@ -313,9 +248,6 @@ def plot_perform_prediction(ax, t_observ, b, t, mean, std_Data, std_ModelData, s
     ax.plot(t_observ, b, color='black', label='true')
     ax.plot(t, mean, color='green', label='pred')
     ax.scatter(t_observ[:t_n], b_n, label='Data', color='green')
-    
-    if (b_est is not None) and t_n < b_est.shape[0]:
-        ax.scatter(time_est[t_n], b_est[t_n], label='estimation', color='orange')
     
     ax.fill_between(t, mean - 1.96 * std_ModelDataFut, 
                             mean - 1.96 * std_ModelData, color='red', alpha=0.2)
@@ -334,7 +266,7 @@ def plot_perform_prediction(ax, t_observ, b, t, mean, std_Data, std_ModelData, s
     ax.set_ylim(y_lim)
 
 def make_perform_video(unit, group_network, t_np,thres, t_observ, A, b, S,
-                    time_est=None, A_est=None, b_est=None, gamma=0.001, 
+                    gamma=0.001, 
                     n_train_unit=80, n_paths=20,ood_coef=0, 
                     name='performance', frames=20, y_lim=(0,1), loc='upper left', time_unit='hours',save=False):
     frames = 20
@@ -352,11 +284,6 @@ def make_perform_video(unit, group_network, t_np,thres, t_observ, A, b, S,
         Sn=S[:t_n]
         bn=b[:t_n]
 
-        # Add estimation if necessary
-        if (b_est is not None) and t_n < b_est.shape[0]:
-            An = np.concatenate([An, A_est[:t_n]], axis=0)
-            bn = np.concatenate([bn, b[:t_n]], axis=0)
-        
         pred_perform, var_Model,var_Data,var_Fut=compute_performance_distribution(t_torch,gamma,group_network,
                                                                                                 An,bn,Sn,
                                                                                                 n_train_unit,n_paths=n_paths,ood_coef=ood_coef)
@@ -366,7 +293,7 @@ def make_perform_video(unit, group_network, t_np,thres, t_observ, A, b, S,
         std_ModelData = gpu2np(torch.sqrt(var_ModelData))
         std_ModelDataFut = gpu2np(torch.sqrt(var_ModelData+var_Fut) )    
 
-        plot_perform_prediction(ax, t_observ, b, t_np, pred_perform, std_Data, std_ModelData, std_ModelDataFut, thres, name, unit, y_lim, loc,time_unit, bn, t_n, time_est, b_est)
+        plot_perform_prediction(ax, t_observ, b, t_np, pred_perform, std_Data, std_ModelData, std_ModelDataFut, thres, name, unit, y_lim, loc,time_unit, bn, t_n)
         
         return mplfig_to_npimage(fig)
 
