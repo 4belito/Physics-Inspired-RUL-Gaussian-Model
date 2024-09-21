@@ -38,11 +38,13 @@ class Tanh(ActivationEq):
         return self.tanh(x)
     
 class Softplus(ActivationEq):
-    def __init__(self):
+    def __init__(self,max_clip=50):
         super(Softplus,self).__init__()
         self.softplus = nn.Softplus()
-
+        self.max_clip = max_clip
+        
     def forward(self, x):
+        #x=torch.clamp(x, max=self.max_clip)
         return self.softplus(x)
 
 import torch  

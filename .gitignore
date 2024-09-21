@@ -164,3 +164,7 @@ cython_debug/
 Experiments/
 Library/
 data/
+convex combination 2d.ipynb
+grild_hyperparameters.ipynb
+results DS05.ipynb
+results._DS01.ipynb

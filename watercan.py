@@ -215,7 +215,7 @@ class Holes(nn.Module):
 
 #Latent Funciton Net
 class LatentF(nn.Module): 
-    def __init__(self, hidden_sizes=[3],channels_out=2,activation=nn.Sigmoid()):
+    def __init__(self, hidden_sizes=[3],channels_out=2,activation=nn.Softplus()):
         super().__init__()
         # save arguments
         self.hidden_sizes=hidden_sizes
@@ -400,27 +400,37 @@ class WaterCan(nn.Module):
 
 ## Group Distribution(to account for model uncertainty)
 # We train several watercan models and then GroupWatercan class group them in only one (mean)model that also accounts for model uncertainty.
-def distribution_out(mean,vars,out_dist,out_std):
+def distribution_out(mean,var,vars,out_dist,out_std):
     if out_dist:
-        var=torch.sum(vars,dim=1,keepdim=True)
         if out_std:
             std=torch.sqrt(var)
             return torch.cat([mean,std],dim=1)
         else:
             return torch.cat([mean,var],dim=1)
     else:
+        data_var=torch.mean(vars,dim=0)
+        model_var=var
         if out_std:
-            stds=torch.sqrt(vars)
-            return mean,stds
+            data_std=torch.sqrt(data_var)
+            model_std=torch.sqrt(var)
+            return mean,torch.cat([data_std,model_std],dim=1)
         else:
-            return mean,vars
+            return mean,torch.cat([data_var,model_var],dim=1)
 
-def group_distribution(group_output,out_dist=True,out_std=True): 
-    mean=torch.mean(group_output[:,:,[0]],dim=0) #mean of the mean
-    mean_var=torch.mean(group_output[:,:,[1]]**2,dim=0) # mean of the variance
-    var_group=torch.var(group_output,dim=0) #variance of the mean and std
-    vars=torch.cat([mean_var,var_group],dim=1)
-    return distribution_out(mean,vars,out_dist,out_std)
+# def group_distribution(group_output,out_dist=True,out_std=True): 
+#     mean=torch.mean(group_output[:,:,[0]],dim=0)
+#     mean_var=torch.mean(group_output[:,:,[1]]**2,dim=0)
+#     var_group=torch.var(group_output,dim=0)
+#     vars=torch.cat([mean_var,var_group],dim=1)
+#     return distribution_out(mean,vars,out_dist,out_std)
+
+
+def GMM_distribution(output,out_dist=True,out_std=True): # Gaussian mixture model
+    means=output[:,:,[0]]
+    vars=output[:,:,[1]]**2
+    mean=torch.mean(means,dim=0)
+    var=torch.mean(vars+(means-mean)**2,dim=0)
+    return distribution_out(mean,var,vars,out_dist,out_std)
 
 class GroupDistributionNet(nn.Module):
     def __init__(self, networks):
@@ -429,10 +439,10 @@ class GroupDistributionNet(nn.Module):
 
     def forward(self, x):
         outputs =torch.stack( [net(x) for net in self.networks])
-        return group_distribution(outputs)
+        return GMM_distribution(outputs)
 
 class GroupWaterCan(nn.Module):
-    def __init__(self,configs):
+    def __init__(self,configs):#,std_bound=float('inf')
         super().__init__()
         n_holes = configs[0]['n_holes']
         n_models = len(configs)
@@ -448,6 +458,7 @@ class GroupWaterCan(nn.Module):
         self.n_holes = n_holes
         self.n_models = n_models 
         self._device = 'cpu'
+        #self.std_bound=std_bound
 
     def load_watercans(self,state_dicts):
         for watercan,state_dict in zip(self.watercans,state_dicts):
@@ -480,6 +491,9 @@ class GroupWaterCan(nn.Module):
         # Find the polynomial coefficients
         for watercan in self.watercans: watercan.set_extension(xs_train,n_points,poly_deg)
 
+    def set_taylor_extension(self,xs_train,poly_deg):
+        for watercan in self.watercans: watercan.set_taylor_extension(xs_train,poly_deg)
+        
     def get_latentf_avg(self):
         latentf_avg=[]
         for watercan in self.watercans: latentf_avg.append(watercan.get_latentf_avg())
@@ -499,39 +513,50 @@ class GroupWaterCan(nn.Module):
         sub_model.to(self.device)
         return sub_model
 
-    def forward_gaussian_lc(self,x, alpha,out_dist=True,out_std=True):
+    def forward_lc(self,x, alpha,out_dist=True,out_std=True):
         means,vars=zip(*self.forward_full(self.n_holes*[x],out_dist=False,out_std=False))        
         # Compute the weighted sum of means and stds
         mean_lc = torch.einsum('i,ijk->jk', alpha, torch.stack(means))
         vars_lc = torch.einsum('i,ijk->jk', alpha**2, torch.stack(vars)) 
         return distribution_out(mean_lc,vars_lc,out_dist,out_std)
-
-    def forward_GMM_lc(self,x, alpha,out_dist=True,out_std=True):
+    
+    def forward_gaussian_lc(self,x, alpha):
         means,vars=zip(*self.forward_full(self.n_holes*[x],out_dist=False,out_std=False))        
         # Compute the weighted sum of means and stds
-        means=torch.stack(means)
-        vars=torch.stack(vars)
-        mean_lc = torch.einsum('i,ijk->jk', alpha, means)
-        vars_lc = torch.einsum('i,ijk->jk', alpha, vars+means**2) - mean_lc**2
-        return distribution_out(mean_lc,vars_lc,out_dist,out_std)
-
-
-
-
+        mean_lc = torch.einsum('ai,ijk->ajk', alpha, torch.stack(means))
+        vars_lc = torch.einsum('ai,ijk->ajk', alpha**2, torch.stack(vars)) 
+        return mean_lc,vars_lc
+    
     def append(self,watercan):
         assert watercan.device == self.watercans[0].device, 'the added watercan must be in the same device as the GroupWaterCan'
         assert watercan.n_holes == self.watercans[0].n_holes, 'the added watercan must must have the same number of holes as the GroupWaterCan'
         self.watercans.append(watercan)
         self.n_models+=1
     
-    def forward_full(self,xs,out_dist,out_std):
-        split_sizes = [x.size(0) for x in xs]  
-        preds= [watercan.forward_fast(xs,split_sizes)[0] for watercan in self.watercans]
-        trajs_preds =[torch.stack(traj_preds) for traj_preds in zip(*preds)]
-        return [group_distribution(trajs_preds[hole],out_dist,out_std) for hole in range(self.n_holes)]
+    # def forward_full(self,xs,out_dist,out_std):
+    #     with torch.no_grad():
+    #         split_sizes = [x.size(0) for x in xs]  
+    #         preds= [watercan.forward_fast(xs,split_sizes)[0] for watercan in self.watercans]
+    #         trajs_preds =[torch.stack(traj_preds) for traj_preds in zip(*preds)]
+    #         out=[GMM_distribution(trajs_preds[hole],out_dist,out_std) for hole in range(self.n_holes)]
+    #     return out
     
+
+    def forward_full(self,xs,out_dist,out_std):
+        with torch.no_grad():
+            split_sizes = [x.size(0) for x in xs]  
+            preds= [watercan.forward_fast(xs,split_sizes)[0] for watercan in self.watercans]
+            trajs_preds =[torch.stack(traj_preds) for traj_preds in zip(*preds)]
+            #for traj in trajs_preds: traj[...,1]=torch.clip(traj[...,1],0,self.std_bound) 
+            out=[GMM_distribution(trajs_preds[hole],out_dist,out_std) for hole in range(self.n_holes)]
+        return out
+
+    
+
     def forward_single(self,x):
         return torch.stack(self(self.n_holes*[x]),dim=1)
     
     def forward(self,xs):
         return self.forward_full(xs,out_dist=True,out_std=True)
+    
+
