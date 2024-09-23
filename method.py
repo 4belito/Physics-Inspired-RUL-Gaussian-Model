@@ -20,8 +20,8 @@ def compute_performance_distribution(t,tn,gamma,group_network,An,bn,Sn,obj_weigh
         #alpha_present=0.5*alpha_present_new+0.5*alpha_present
         present_var_alphas=uncenter_var(x=pred_alphas,center=alpha_present[np.newaxis,:],n=n_paths)#
         #Future
-        base_prob,alpha_min=evaluate_smart_base(An,bn,Sn,obj_weights,n_train_unit,pending)
-        future_var_alphas=uncenter_var(x=pred_alphas,center=np.diag(alpha_min),n=n_paths) #
+        base_prob,alphas_min=evaluate_smart_base(An,bn,Sn,obj_weights,n_train_unit,pending)
+        future_var_alphas=uncenter_var(x=pred_alphas,center=np.diag(alphas_min),n=n_paths) #
     else:
         pending=1
         base_prob=np.ones(n_train_unit)/n_train_unit
@@ -51,19 +51,20 @@ def mc_simulation(group_network,t,tn,n,n_train_unit,An, bn,Sn,obj_weights,presen
     present_preds_mean,future_preds_mean=[],[]
     present_preds_vars,future_preds_vars=[],[]
     present_alphas,future_alphas=[],[]
-
-    mean_future_var=np.mean(future_var,axis=1)
-    mean_present_var=np.mean(present_var)
-    future_rate=pending*np.mean(mean_future_var)/(np.mean(mean_future_var)+mean_present_var)
-    present_rate= 1-future_rate# #try  2: pending only
+    if len(bn)==89:
+        print('stop')
+    trust_future=1/np.mean(future_var,axis=1)
+    trust_present=1/np.mean(present_var)
+    present_rate=1/(1+np.max(trust_future)/trust_present)
+    future_rate= 1-present_rate# #try  2: pending only
     future_std=np.sqrt(future_var)
     present_std=np.sqrt(present_var)
     future_belief_size=np.clip(future_std,0,1)#(1+pending)*future_std/(present_std+future_std)
     present_belief_size=np.clip(present_std,0,1)
     while n_sampled<n_paths:
-        alphas=sample_present(present_alpha,math.ceil((n_paths-n_sampled)*present_rate), n_train_unit,present_belief_size)
+        alphas=sample_present(present_alpha,math.floor((n_paths-n_sampled)*present_rate), n_train_unit,present_belief_size)
         if len(alphas) and n: 
-            alphas=adjust_present(An, bn,Sn, gamma*present_var,pending,alphas,obj_weights) 
+            alphas=adjust_present(An, bn,Sn, gamma*trust_present,pending,alphas,obj_weights) 
         alphas_torch=torch.tensor(alphas, dtype=torch.float32,device=group_network.device)     
         preds_mean, preds_vars= trajectory_evaluation(group_network,t,alphas_torch)
         preds_vars=preds_vars[...,0]
@@ -73,15 +74,16 @@ def mc_simulation(group_network,t,tn,n,n_train_unit,An, bn,Sn,obj_weights,presen
         mask= is_monotonic_decreasing((preds_mean+1.96*stds)[:,t[:,0]>=tn]) #>=tn
         #mask= torch.tensor([True for _ in preds_mean]) 
         if any(mask):
-            n_sampled+=sum(mask).item()        
+            n_sampled_present=sum(mask).item()  
             present_preds_mean.append(preds_mean[mask])
             present_preds_vars.append(preds_vars[mask])
             present_alphas.append(alphas_torch[mask])
-        
+        else:
+            n_sampled_present=0
         # Future
-        alphas,center_choice=sample_future(future_prob,math.floor((n_paths-n_sampled)*future_rate), n_train_unit,future_belief_size)
+        alphas,center_choice=sample_future(future_prob,math.ceil((n_paths-n_sampled)*future_rate), n_train_unit,future_belief_size)
         if len(alphas) and n: 
-            alphas=adjust_future(An, bn,Sn, gamma*future_var[center_choice],pending,alphas,obj_weights) 
+            alphas=adjust_future(An, bn,Sn, gamma*trust_future[center_choice],pending,alphas,obj_weights) 
         alphas_torch=torch.tensor(alphas, dtype=torch.float32,device=group_network.device)     
         preds_mean, preds_vars= trajectory_evaluation(group_network,t,alphas_torch)
         # Prune the no_monotonic simulations
@@ -91,10 +93,14 @@ def mc_simulation(group_network,t,tn,n,n_train_unit,An, bn,Sn,obj_weights,presen
         mask= is_monotonic_decreasing((preds_mean+1.96*stds)[:,t[:,0]>=tn]) 
         #mask= torch.tensor([True for _ in preds_mean]) 
         if any(mask):
-            n_sampled+=sum(mask).item()        
+            n_sampled_future=sum(mask).item()
             future_preds_mean.append(preds_mean[mask])
             future_preds_vars.append(preds_vars[mask])
             future_alphas.append(alphas_torch[mask])
+        else:
+            n_sampled_future=0
+        n_sampled+=n_sampled_present+n_sampled_future
+        #print(n_sampled)
     time_len=len(t)
     present_preds_mean=torch.concat(present_preds_mean) if len(present_preds_mean) else torch.empty((0,time_len),device=group_network.device)
     present_preds_vars=torch.concat(present_preds_vars) if len(present_preds_vars) else torch.empty((0,time_len),device=group_network.device)
@@ -122,10 +128,15 @@ def convex_objective(alpha, A, b, S,gamma,alpha0,pending,weights):#,progress
 
 ## Evaluation
 def evaluate_smart_base(An,bn,Sn,obj_weights,n_train_unit,pending):
-    constr = [] #{'type': 'ineq', 'fun': pos_constraint},{'type': 'ineq', 'fun': p_norm_constraint}
-    obj_weights = np.exp(30*(1-bn)) 
-    alphas_min=np.concatenate([minimize(gaussian_density, x0=1,  args=(An[:,[i]], bn,Sn[:,[i]],obj_weights),constraints=constr).x for i in range(n_train_unit)])
-    scores=np.array([gaussian_density(alpha,An[:,i], bn,Sn[:,i],obj_weights) for i,alpha in enumerate(alphas_min)])
+    alphas_min=[]
+    scores=[]
+    for i in range(n_train_unit):
+        result=minimize(gaussian_density, x0=1,  args=(An[:,[i]], bn,Sn[:,[i]],obj_weights))
+        alphas_min.append(result.x[0])
+        scores.append(result.fun)
+    alphas_min=np.array(alphas_min)
+    scores=np.array(scores)
+    #scores=np.array([gaussian_density(alpha,An[:,i], bn,Sn[:,i],obj_weights) for i,alpha in enumerate(alphas_min)])
     e_values = np.exp(-(scores-np.min(scores))**(1-pending))  
     prob = e_values / np.sum(e_values)
     return prob,alphas_min

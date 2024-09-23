@@ -32,7 +32,6 @@ class PolyTaylorNet(nn.Module):
     
     def forward(self, x):
         y = torch.zeros_like(x)
-
         for i, der in enumerate(self.derivatives):
             y += der * (x-self.a)**i/self.factorials[i]
         return y
@@ -91,7 +90,7 @@ class MonotLinear(nn.Module):
         assert positive_outs is None or len(positive_outs)==out_features, 'The positive_out argument has to be a boolean list with len out_features or None'
         assert monot_outs is None or len(monot_outs)==out_features, 'The monot_out argument has to be a boolean list with len out_features or None'
         softinv1=0.541324854612918 #~torch.log(torch.exp(torch.tensor(1.0)) - 1)
-        self.weight = nn.Parameter(torch.randn(out_features, in_features)+softinv1)
+        self.slope_params = nn.Parameter(torch.randn(out_features, in_features)+softinv1)
         if bias:
             self.bias = nn.Parameter(torch.randn(out_features))
         else:
@@ -110,10 +109,12 @@ class MonotLinear(nn.Module):
             weights_avg.append(avg_param)
         for param_self, avg_param in zip(self.parameters(), weights_avg):
             param_self.data.copy_(avg_param)
+    
+    def get_slopes(self):
+        return torch.where(self.monot_outs, self.positive(self.slope_params), -self.positive(self.slope_params))
 
     def forward(self, x):
-        sign_weight =  torch.where(self.monot_outs, self.positive(self.weight), -self.positive(self.weight)) 
-        out=nn.functional.linear(x, sign_weight, self.bias)
+        out=nn.functional.linear(x, self.get_slopes(), self.bias)
         out=torch.where(self.positive_outs, self.positive(out), out)
         return out
 
@@ -122,7 +123,7 @@ class MonotIsoLinear(nn.Module):
         super().__init__()
         assert positive_outs is None or len(positive_outs)==features, 'The positive_out parameters has to be a boolean list with len our_features or None'
         assert monot_outs is None or len(monot_outs)==features, 'The monot_out parameters has to be a boolean list with len our_features or None'
-        self.weight = nn.Parameter(torch.randn(features))
+        self.slope_params = nn.Parameter(torch.randn(features))
         if bias:
             self.bias = nn.Parameter(torch.randn(features))
         else:
@@ -142,9 +143,11 @@ class MonotIsoLinear(nn.Module):
         for param_self, avg_param in zip(self.parameters(), weights_avg):
             param_self.data.copy_(avg_param)
 
+    def get_slopes(self):
+        return torch.where(self.monot_outs, self.positive(self.slope_params), -self.positive(self.slope_params))
+
     def forward(self, x):
-        sign_weight =  torch.where(self.monot_outs, self.positive(self.weight), -self.positive(self.weight)) #
-        out=x*sign_weight+ self.bias
+        out=x*self.get_slopes()+ self.bias
         out=torch.where(self.positive_outs, self.positive(out), out)
         return out
     
@@ -169,25 +172,33 @@ class Holes(nn.Module):
                 hole=MonotLinear(input_dim,out_dim,positive_outs=positive_outs,monot_outs=monot_outs)
             self.holes.append(hole)
 
-    def get_weights_std(self):
-        weights = [hole.parameters() for hole in self.holes] 
-        weights_std = []
-        for param_group in zip(*weights):
-            std_param = torch.std(torch.stack(param_group), dim=0)
-            weights_std.append(std_param)
-        return weights_std
+    # def get_weights_std(self):
+    #     weights = [hole.parameters() for hole in self.holes] 
+    #     weights_std = []
+    #     for param_group in zip(*weights):
+    #         std_param = torch.std(torch.stack(param_group), dim=0)
+    #         weights_std.append(std_param)
+    #     return weights_std
 
-    def get_weights_mean(self):
-        weights = [hole.parameters() for hole in self.holes]  #[[param for param in hole.parameters()] for hole in self.holes]
-        weights_mean = []
-        for param_group in zip(*weights):
-            mean_param = torch.mean(torch.stack(param_group), dim=0)
-            weights_mean.append(mean_param)
-        return weights_mean
+    # def get_weights_mean(self):
+    #     weights = [hole.parameters() for hole in self.holes]  #[[param for param in hole.parameters()] for hole in self.holes]
+    #     weights_mean = []
+    #     for param_group in zip(*weights):
+    #         mean_param = torch.mean(torch.stack(param_group), dim=0)
+    #         weights_mean.append(mean_param)
+    #     return weights_mean
+
+    def get_weights(self):
+        weights = [torch.cat([param.view(-1) for param in hole.parameters()]) for hole in self.holes]
+        return torch.stack(weights)  # Shape: (num_holes, num_params)
+    
+    def get_slopes(self):
+        slopes = [hole.get_slopes() for hole in self.holes]
+        return torch.stack(slopes) # Shape: (num_holes, num_slopes)
+
 
     def get_weights_zscores(self):
-        weights = [torch.cat([param.view(-1) for param in hole.parameters()]) for hole in self.holes]
-        weights = torch.stack(weights)  # Shape: (num_holes, num_params)
+        weights=self.get_weights()
         mean_param = torch.mean(weights, dim=0)
         std_param = torch.std(weights, dim=0)
 
