@@ -73,3 +73,8 @@ def euclidean_uncenter_var(x,center,n):
 def euclidean_var(x,n):
     center=np.mean(x,axis=0,keepdims=True)    
     return euclidean_uncenter_var(x,center,n)
+
+def scoring(true,pred,a=1/13,b=1/10):
+    delta=true-pred
+    exp=np.exp(a*delta)*(delta > 0)+np.exp(-b*delta)*(delta <= 0)-1
+    return np.sum(exp) 
